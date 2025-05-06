@@ -1,0 +1,170 @@
+import numpy as np
+import gymnasium as gym
+import argparse
+import os
+
+# Global variables
+global_best = None
+v_max = 3  # Reduced velocity to prevent extreme jumps
+def levy_flight(Lambda):
+    """ Generate Lévy flight step using Mantegna's algorithm """
+    sigma1 = (np.math.gamma(1 + Lambda) * np.sin(np.pi * Lambda / 2) /
+              (np.math.gamma((1 + Lambda) / 2) * Lambda * 2 ** ((Lambda - 1) / 2))) ** (1 / Lambda)
+    sigma2 = 1  # Standard normal distribution
+    
+    u = np.random.normal(0, sigma1, size=36)  # Random step
+    v = np.random.normal(0, sigma2, size=36)  
+    step = u / (np.abs(v) ** (1 / Lambda))  # Lévy step formula
+    return step
+class Fish:
+    def __init__(self, location, velocity, p_best):
+        self.location = np.array(location)
+        self.velocity = np.array(velocity)
+        self.p_best = np.array(p_best)
+
+    def getVelocity(self):
+        return self.velocity
+
+    def getLocation(self):
+        return self.location
+
+    def getPersonalBest(self):
+        return self.p_best
+
+    def checkBest(self, new_location):
+        if evaluate_policy(new_location) > evaluate_policy(self.p_best):  # Maximize score
+            self.p_best = np.array(new_location)
+
+    def updateLocation(self, new_location):
+        self.location = np.array(new_location)
+
+    def updateVelocity(self, new_velocity):
+        self.velocity = np.array(new_velocity)
+
+def policy_action(params, observation):
+    W = params[:8 * 4].reshape(8, 4)
+    b = params[8 * 4:].reshape(4)
+    logits = np.dot(observation, W) + b
+    return np.argmax(logits)
+
+def evaluate_policy(params, episodes=3, render=False):
+    total_reward = 0.0
+    for _ in range(episodes):
+        env = gym.make('LunarLander-v3', render_mode='human' if render else 'rgb_array')
+        observation, info = env.reset()
+        episode_reward = 0.0
+        done = False
+        while not done:
+            action = policy_action(params, observation)
+            observation, reward, terminated, truncated, info = env.step(action)
+            episode_reward += reward
+            done = terminated or truncated
+        env.close()
+        total_reward += episode_reward
+    return total_reward / episodes  # Return average score
+
+def initialize_swarm(swarm_count=100):
+    param_size = 8 * 4 + 4  # 36 parameters (weights + biases)
+    
+    # Better initialization: Scale to [-0.5, 0.5] instead of completely random
+    locations = np.random.uniform(-0.5, 0.5, (swarm_count, param_size))
+    velocities = np.random.uniform(-v_max, v_max, (swarm_count, param_size))  
+
+    swarm = [Fish(locations[i], velocities[i], locations[i]) for i in range(swarm_count)]
+    return swarm
+
+def get_new_velocity(fish, inertia=0.5, cognitive_influence=1.5, social_acceleration=1.5):
+    global global_best
+
+    v_old = fish.getVelocity()
+    p_best = fish.getPersonalBest()
+    location = fish.getLocation()
+
+    # PSO velocity update formula
+    v_new = (inertia * v_old + 
+             cognitive_influence * np.random.rand() * (p_best - location) +
+             social_acceleration * np.random.rand() * (global_best - location))
+
+    # Clamping velocity to prevent excessive jumps
+    v_new = np.clip(v_new, -v_max, v_max)
+    
+    return v_new
+
+def get_new_position(fish, velocity, levy_prob=0.3, Lambda=1.5):
+    """
+    Update the position using velocity with a probability of using Lévy flight.
+    levy_prob: Probability of applying a Lévy flight instead of a standard velocity update.
+    """
+    if np.random.rand() < levy_prob:
+        # Lévy Flight step
+        levy_step = levy_flight(Lambda)
+        return fish.getLocation() + levy_step
+    else:
+        # Standard velocity update
+        return fish.getLocation() + velocity
+def pso(swarm_count=100, swarm=None, cognitive_influence=0.7, social_acceleration=1.0, inertia=0.4, iterations=1000):
+    if swarm is None:
+        print("Something went wrong! Exiting.")
+        exit(1)
+
+    global global_best
+    global_best = max(swarm, key=lambda fish: evaluate_policy(fish.getPersonalBest())).getPersonalBest()
+
+    print("Starting PSO optimization...\n")
+
+    for iteration in range(1, iterations + 1):  
+        for i in range(swarm_count):
+            v_new = get_new_velocity(swarm[i])
+            x_new = get_new_position(swarm[i], v_new)
+            swarm[i].checkBest(x_new)
+            swarm[i].updateLocation(x_new)
+            swarm[i].updateVelocity(v_new)
+
+        # Update global best
+        best_fish = max(swarm, key=lambda fish: evaluate_policy(fish.getPersonalBest()))
+        if evaluate_policy(best_fish.getPersonalBest()) > evaluate_policy(global_best):
+            global_best = best_fish.getPersonalBest()
+
+        # 🔥 Progress Bar with ASCII Art
+        progress = int((iteration / iterations) * 50)
+        bar = "#" * progress + "-" * (50 - progress)
+        avg_fitness = np.mean([evaluate_policy(fish.getPersonalBest()) for fish in swarm])
+        
+        print(f"\rIteration {iteration}/{iterations} [{bar}] Avg Fitness: {avg_fitness:.2f}  Best: {evaluate_policy(global_best):.2f}", end='', flush=True)
+
+    print("\nOptimization complete! ✅")
+    return global_best  # Return best policy parameters
+
+def train_and_save(filename, swarm_count=100):
+    best_params = pso(swarm_count=swarm_count, swarm=initialize_swarm(), iterations=1000)
+    np.save(filename, best_params)
+    print(f"\n🚀 Best policy saved to {filename}")
+    return best_params
+
+def load_policy(filename):
+    if not os.path.exists(filename):
+        print(f"❌ File {filename} does not exist.")
+        return None
+    best_params = np.load(filename)
+    print(f"📂 Loaded best policy from {filename}")
+    return best_params
+
+def play_policy(best_params, episodes=5):
+    test_reward = evaluate_policy(best_params, episodes=episodes, render=True)
+    print(f"\n🎮 Average reward over {episodes} episodes: {test_reward:.2f}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train or play best policy for Lunar Lander using PSO.")
+    parser.add_argument("--train", action="store_true", help="Train the policy using PSO and save it.")
+    parser.add_argument("--play", action="store_true", help="Load the best policy and play.")
+    parser.add_argument("--filename", type=str, default="best_policy.npy", help="Filename to save/load the best policy.")
+    args = parser.parse_args()
+
+    if args.train:
+        best_params = train_and_save(args.filename)
+    elif args.play:
+        best_params = load_policy(args.filename)
+        if best_params is not None:
+            play_policy(best_params, episodes=5)
+    else:
+        print("⚠️ Please specify --train to train and save a policy, or --play to load and play the best policy.")
